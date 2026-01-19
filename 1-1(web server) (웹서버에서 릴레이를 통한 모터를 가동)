@@ -1,0 +1,129 @@
+import network, machine, socket, gc, time
+from machine import Pin, PWM
+
+# --- 1. Wi-Fi 설정 (본인의 환경에 맞게 수정) ---
+SSID = 'IOT'
+PASSWORD = '12345678'
+
+def connect_wifi():
+    wifi = network.WLAN(network.STA_IF)
+    wifi.active(True)
+    wifi.connect(SSID, PASSWORD)
+    print("Connecting to WiFi", end="")
+    while not wifi.isconnected():
+        print(".", end="")
+        time.sleep(0.5)
+    ip = wifi.ifconfig()[0]
+    print("\nConnected! IP Address:", ip)
+    return ip
+
+# --- 2. 하드웨어 설정 및 초기화 ---
+# 릴레이: GPIO 16
+relay = Pin(16, Pin.OUT)
+relay.value(0)  # 시작 시 꺼짐 상태 강제 설정
+
+# 팬 모듈 (L9110S): INA(14), INB(27)
+fan_ina = PWM(Pin(14), freq=1000) 
+fan_ina.duty(0) # 시작 시 속도 0 설정
+fan_inb = Pin(27, Pin.OUT)
+fan_inb.value(0)
+
+# 상태 관리 변수
+fan_running = False
+current_speed = 750  # 초기 설정 속도만 저장
+
+# --- 3. 제어 로직 (빠른 반응을 위해 최적화) ---
+def control_fan(state, speed):
+    global fan_running
+    if state:
+        relay.value(1) 
+        # 아주 짧은 대기로 기동성 확보
+        fan_inb.value(0)
+        fan_ina.duty(speed)
+        fan_running = True
+    else:
+        fan_ina.duty(0)
+        fan_inb.value(0)
+        relay.value(0)
+        fan_running = False
+
+# --- 4. 미니멀 디자인 HTML ---
+def web_page():
+    status_text = "ACTIVE" if fan_running else "IDLE"
+    status_color = "#2ecc71" if fan_running else "#bdc3c7"
+    
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{ font-family: -apple-system, sans-serif; background: #fafafa; display: flex; 
+                   justify-content: center; align-items: center; height: 100vh; margin: 0; }}
+            .card {{ width: 320px; text-align: center; padding: 40px; border-radius: 40px; 
+                     background: white; box-shadow: 0 15px 35px rgba(0,0,0,0.05); }}
+            .status {{ font-size: 11px; color: {status_color}; font-weight: 900; letter-spacing: 2px; margin-bottom: 5px; }}
+            .speed-val {{ font-size: 72px; font-weight: 200; margin: 15px 0; color: #333; }}
+            .btn-group {{ display: flex; gap: 12px; margin-bottom: 35px; }}
+            .btn {{ flex: 1; padding: 18px; border: none; border-radius: 15px; cursor: pointer; font-size: 14px; font-weight: 700; }}
+            .on {{ background: #111; color: white; }}
+            .off {{ background: #f0f0f0; color: #aaa; }}
+            .slider {{ width: 100%; -webkit-appearance: none; height: 4px; background: #eee; border-radius: 2px; outline: none; }}
+            .slider::-webkit-slider-thumb {{ -webkit-appearance: none; width: 26px; height: 26px; background: #111; 
+                                            border-radius: 50%; cursor: pointer; border: 5px solid white; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div class="status">● {status_text}</div>
+            <div class="speed-val">{current_speed}</div>
+            <form action="./">
+                <div class="btn-group">
+                    <button name="p" value="1" class="btn on">START</button>
+                    <button name="p" value="0" class="btn off">STOP</button>
+                </div>
+                <input type="range" name="s" min="450" max="1023" value="{current_speed}" class="slider" onchange="this.form.submit()">
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+# --- 5. 서버 실행 (속도 최적화) ---
+ip = connect_wifi()
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # 주소 재사용 설정
+s.bind(('', 80))
+s.listen(1) # 대기 큐 축소로 반응성 향상
+
+print("Server is Ready.")
+
+while True:
+    try:
+        conn, addr = s.accept()
+        # 타임아웃 없이 즉시 처리
+        request = conn.recv(1024).decode()
+        
+        # 데이터 처리
+        if 'p=1' in request: 
+            control_fan(True, current_speed)
+        elif 'p=0' in request: 
+            control_fan(False, 0)
+        
+        if 's=' in request:
+            try:
+                speed_str = request.split('s=')[1].split(' ')[0]
+                current_speed = int(speed_str)
+                if fan_running:
+                    control_fan(True, current_speed)
+            except: pass
+
+        # 응답 전송 및 즉시 종료
+        conn.send('HTTP/1.1 200 OK\nContent-Type: text/html\nConnection: close\n\n' + web_page())
+        conn.close()
+        
+    except Exception as e:
+        if 'conn' in locals(): conn.close()
+        # 메모리 관리는 필요할 때만 수행하도록 변경
+        if gc.mem_free() < 20000: gc.collect()
