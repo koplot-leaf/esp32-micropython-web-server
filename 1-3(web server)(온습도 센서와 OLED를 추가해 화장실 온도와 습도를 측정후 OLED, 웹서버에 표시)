@@ -1,0 +1,120 @@
+import network, machine, socket, gc, time, dht
+from machine import Pin, PWM, I2C
+import ssd1306
+
+# --- 1. Wi-Fi 및 장치 설정 ---
+SSID, PASSWORD = 'IOT', '12345678'
+
+# I2C 설정 (OLED)
+try:
+    i2c = I2C(0, scl=Pin(22), sda=Pin(21))
+    oled = ssd1306.SSD1306_I2C(128, 64, i2c)
+except:
+    oled = None
+    print("OLED 연결 실패")
+
+# 센서류 설정
+dht_sensor = dht.DHT11(Pin(4)) # 온습도
+obs_sensor = Pin(13, Pin.IN)    # 장애물
+
+# 제어류 설정
+relay = Pin(16, Pin.OUT); relay.value(0)
+fan_ina = PWM(Pin(14), freq=1000); fan_ina.duty(0)
+fan_inb = Pin(27, Pin.OUT); fan_inb.value(0)
+
+fan_running = False
+current_speed = 750
+temp, hum = 0, 0
+
+# --- 2. 핵심 기능 함수 ---
+def update_data():
+    global temp, hum
+    try:
+        dht_sensor.measure()
+        temp = dht_sensor.temperature()
+        hum = dht_sensor.humidity()
+    except: pass
+    
+    if oled:
+        oled.fill(0)
+        oled.text("SMART TOILET", 15, 0)
+        oled.text("-" * 15, 0, 12)
+        oled.text(f"Temp : {temp} C", 0, 28)
+        oled.text(f"Humi : {hum} %", 0, 42)
+        status = "OCCUPIED" if obs_sensor.value() == 0 else "VACANT"
+        oled.text(f"STAT : {status}", 0, 56)
+        oled.show()
+
+def control_fan(state, speed):
+    global fan_running
+    relay.value(1 if state else 0)
+    if state:
+        fan_inb.value(0)
+        fan_ina.duty(speed)
+        fan_running = True
+    else:
+        fan_ina.duty(0)
+        fan_running = False
+
+# --- 3. 웹 UI 디자인 ---
+def web_page():
+    is_occ = (obs_sensor.value() == 0)
+    occ_text, occ_color = ("OCCUPIED", "#FF4757") if is_occ else ("VACANT", "#2ED573")
+    on_style = "background:#2c3e50;color:white;" if fan_running else "background:#eee;color:#aaa;"
+    off_style = "background:#e74c3c;color:white;" if not fan_running else "background:#eee;color:#aaa;"
+    
+    return f"""<!DOCTYPE html><html><head><meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width,initial-scale=1'>
+    <meta http-equiv='refresh' content='4'>
+    <style>
+        body {{ font-family:sans-serif; background:#f0f2f5; display:flex; flex-direction:column; align-items:center; padding:20px; }}
+        .card {{ background:white; width:100%; max-width:350px; padding:20px; border-radius:20px; margin-bottom:15px; box-shadow:0 5px 15px rgba(0,0,0,0.05); text-align:center; }}
+        .box {{ padding:15px; border-radius:12px; border:2px solid {occ_color}; color:{occ_color}; font-weight:bold; }}
+        .grid {{ display:flex; justify-content:space-around; margin:15px 0; }}
+        .val {{ font-size:22px; font-weight:bold; color:#3498db; }}
+        .btn {{ flex:1; padding:15px; border:none; border-radius:12px; cursor:pointer; font-weight:bold; }}
+    </style></head><body>
+    <div class='card'><div class='box'>{occ_text}</div></div>
+    <div class='card'><div class='grid'>
+        <div><div style='font-size:12px;color:#888;'>온도</div><div class='val'>{temp}℃</div></div>
+        <div><div style='font-size:12px;color:#888;'>습도</div><div class='val'>{hum}%</div></div>
+    </div></div>
+    <div class='card'>
+        <div style='font-size:40px; font-weight:200;'>{current_speed if fan_running else 0}</div>
+        <form action='./'><div style='display:flex; gap:10px;'>
+            <button name='p' value='1' class='btn' style='{on_style}'>FAN ON</button>
+            <button name='p' value='0' class='btn' style='{off_style}'>OFF</button>
+        </div><input type='range' name='s' min='450' max='1023' value='{current_speed}' style='width:100%;margin-top:15px;' onchange='this.form.submit()'></form>
+    </div></body></html>"""
+
+# --- 4. 서버 실행 ---
+wlan = network.WLAN(network.STA_IF); wlan.active(True); wlan.connect(SSID, PASSWORD)
+while not wlan.isconnected(): time.sleep(0.5)
+ip = wlan.ifconfig()[0]
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('', 80))
+s.listen(1)
+print("Server IP:", ip)
+
+while True:
+    try:
+        update_data() # 센서 갱신 & OLED 출력
+        s.settimeout(1.0)
+        try:
+            conn, addr = s.accept()
+            req = conn.recv(1024).decode()
+            if 'p=1' in req: control_fan(True, current_speed)
+            elif 'p=0' in req: control_fan(False, 0)
+            if 's=' in req:
+                start = req.find('s=') + 2
+                end = req.find(' ', start)
+                current_speed = int(req[start:end])
+                if fan_running: control_fan(True, current_speed)
+            conn.send('HTTP/1.1 200 OK\nContent-Type: text/html\nConnection: close\n\n')
+            conn.sendall(web_page())
+            conn.close()
+        except: pass
+    except Exception as e: print("Error:", e)
+    gc.collect()
