@@ -1,0 +1,110 @@
+import network, machine, socket, gc, time
+from machine import Pin, PWM
+
+# --- 1. Wi-Fi 및 하드웨어 초기화 ---
+SSID, PASSWORD = 'IOT', '12345678'                           
+
+def connect_wifi():
+    w = network.WLAN(network.STA_IF)
+    w.active(True)
+    w.connect(SSID, PASSWORD)
+    while not w.isconnected(): time.sleep(0.1)
+    return w.ifconfig()[0]
+
+relay = Pin(16, Pin.OUT); relay.value(0)
+fan_ina = PWM(Pin(14), freq=1000); fan_ina.duty(0)
+fan_inb = Pin(27, Pin.OUT); fan_inb.value(0)
+sensor = Pin(13, Pin.IN) # 장애물 센서
+
+fan_running = False
+current_speed = 750
+
+def control_fan(state, speed):
+    global fan_running
+    relay.value(1 if state else 0)
+    if state:
+        fan_inb.value(0)
+        fan_ina.duty(speed)
+        fan_running = True
+    else:
+        fan_ina.duty(0)
+        fan_running = False
+
+# --- 3. 섹션 분리형 웹 페이지 (UI/UX 개선) ---
+def web_page():
+    is_occ = (sensor.value() == 0)
+    
+    # 팬 상태에 따른 버튼 색상 결정
+    on_style = "background:#2c3e50; color:white;" if fan_running else "background:#eee; color:#aaa;"
+    off_style = "background:#e74c3c; color:white;" if not fan_running else "background:#eee; color:#aaa;"
+    
+    # 화장실 상태에 따른 구역 색상 결정
+    occ_text = "사용 중 (OCCUPIED)" if is_occ else "비어 있음 (VACANT)"
+    occ_bg = "#fff5f5" if is_occ else "#f5fff5"
+    occ_border = "#ff4757" if is_occ else "#2ed573"
+
+    return f"""<!DOCTYPE html><html><head><meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width,initial-scale=1'>
+    <meta http-equiv='refresh' content='3'>
+    <style>
+        body {{ font-family:sans-serif; background:#f0f2f5; display:flex; flex-direction:column; align-items:center; padding:20px; }}
+        .section {{ background:white; width:90%; max-width:350px; padding:25px; border-radius:20px; margin-bottom:20px; box-shadow:0 5px 15px rgba(0,0,0,0.05); }}
+        h2 {{ font-size:16px; color:#555; margin-top:0; border-bottom:1px solid #eee; padding-bottom:10px; }}
+        .status-box {{ padding:20px; border-radius:15px; background:{occ_bg}; border:2px solid {occ_border}; color:{occ_border}; font-weight:bold; font-size:18px; }}
+        .speed-val {{ font-size:45px; font-weight:200; margin:10px 0; }}
+        .btn-group {{ display:flex; gap:10px; margin-top:15px; }}
+        .btn {{ flex:1; padding:15px; border:none; border-radius:12px; cursor:pointer; font-weight:bold; transition:0.3s; }}
+        input {{ width:100%; margin-top:15px; }}
+    </style></head><body>
+
+    <div class='section'>
+        <h2>🚽 화장실 상태</h2>
+        <div class='status-box'>{occ_text}</div>
+    </div>
+
+    <div class='section'>
+        <h2>🌀 환풍기 제어</h2>
+        <div class='speed-val'>{current_speed if fan_running else 0}</div>
+        <form action='./'>
+            <div class='btn-group'>
+                <button name='p' value='1' class='btn' style='{on_style}'>켜짐 (ON)</button>
+                <button name='p' value='0' class='btn' style='{off_style}'>꺼짐 (OFF)</button>
+            </div>
+            <input type='range' name='s' min='450' max='1023' value='{current_speed}' onchange='this.form.submit()'>
+        </form>
+    </div>
+
+    <p style='color:#bbb; font-size:10px;'>2초마다 상태가 갱신됩니다.</p>
+    </body></html>"""
+
+# --- 4. 서버 실행 (포트 오류 방지 포함) ---
+ip = connect_wifi()
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # bind 오류 방지
+s.bind(('', 80))
+s.listen(1)
+
+print("Server is live at:", ip)
+
+while True:
+    try:
+        conn, addr = s.accept()
+        req = conn.recv(1024).decode()
+        
+        if 'p=1' in req: control_fan(True, current_speed)
+        elif 'p=0' in req: control_fan(False, 0)
+        
+        if 's=' in req:
+            try:
+                start = req.find('s=') + 2
+                end = req.find(' ', start)
+                current_speed = int(req[start:end])
+                if fan_running: control_fan(True, current_speed)
+            except: pass
+
+        conn.send('HTTP/1.1 200 OK\nContent-Type: text/html\nConnection: close\n\n')
+        conn.sendall(web_page())
+        conn.close()
+    except:
+        if 'conn' in locals(): conn.close()
+    gc.collect()
