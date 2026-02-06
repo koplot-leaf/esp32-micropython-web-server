@@ -1,0 +1,109 @@
+import network, machine, socket, gc, time, dht, json
+from machine import Pin, PWM
+
+# --- [1. 장치 및 핀 설정] ---
+# 릴레이 및 온습도 센서
+relay_fan = Pin(16, Pin.OUT, value=1)
+relay_pump = Pin(17, Pin.OUT, value=1)
+fan_st, pump_st = "OFF", "OFF"
+sensor = dht.DHT11(Pin(14))
+temp, hum = 0, 0
+
+# 장애물 감지 센서 (GPIO 13)
+ir_sensor = Pin(13, Pin.IN)
+obstacle_st = "안전"
+
+# 서보모터 (GPIO 15)
+servo = PWM(Pin(15), freq=50)
+def set_angle(angle):
+    duty = int(((angle / 180) * 102) + 26)
+    servo.duty(duty)
+set_angle(0)
+
+# --- [2. 네트워크 설정] ---
+SSID, PW = 'IOT', '12345678'
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+wlan.connect(SSID, PW)
+
+while not wlan.isconnected():
+    time.sleep(0.5)
+print("\n주소: http://" + wlan.ifconfig()[0])
+
+# --- [3. 웹페이지 HUD] ---
+def web_page():
+    return f"""<!DOCTYPE html><html><head><meta charset='UTF-8'>
+    <script>
+        function updateData() {{
+            fetch('/data').then(res => res.json()).then(data => {{
+                document.getElementById('temp').innerText = data.temp;
+                document.getElementById('hum').innerText = data.hum;
+                document.getElementById('obs').innerText = data.obs;
+            }}).catch(err => console.log('Error:', err));
+        }}
+        setInterval(updateData, 1000); // 1초마다 업데이트
+    </script>
+    </head><body>
+        <h1>스마트 시스템 제어</h1>
+        <hr>
+        <h3>실시간 모니터링</h3>
+        <p>온도: <span id="temp">{temp}</span> C / 습도: <span id="hum">{hum}</span> %</p>
+        <p>장애물 상태: <span id="obs">{obstacle_st}</span></p>
+        <hr>
+        <h3>장치 제어</h3>
+        <p>환풍기: {fan_st} / 워터펌프: {pump_st}</p>
+        <a href="/?f1"><button style="padding:15px; width:100px;">팬 ON</button></a>
+        <a href="/?f0"><button style="padding:15px; width:100px;">팬 OFF</button></a>
+        <br><br>
+        <a href="/?p1"><button style="padding:15px; width:100px;">펌프 ON</button></a>
+        <a href="/?p0"><button style="padding:15px; width:100px;">펌프 OFF</button></a>
+        <br><br>
+        <a href="/?s1"><button style="padding:15px; width:100px;">서보 90도</button></a>
+        <a href="/?s0"><button style="padding:15px; width:100px;">서보 0도</button></a>
+    </body></html>"""
+
+# --- [4. 서버 로직] ---
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('', 80))
+s.listen(5)
+
+while True:
+    try:
+        conn, addr = s.accept()
+        raw_request = conn.recv(1024)
+        if not raw_request:
+            conn.close()
+            continue
+        request = raw_request.decode()
+        
+        # 1. 데이터 응답 (온습도 + 장애물 상태)
+        if '/data' in request:
+            try:
+                sensor.measure()
+                temp, hum = sensor.temperature(), sensor.humidity()
+            except: pass
+            
+            # IR 센서는 장애물 감지 시 0(Low), 평상시 1(High)을 반환하는 경우가 많음
+            obs_val = "감지됨" if ir_sensor.value() == 0 else "안전"
+            
+            data_dict = {"temp": temp, "hum": hum, "obs": obs_val}
+            conn.send('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n')
+            conn.send(json.dumps(data_dict))
+        
+        # 2. 메인 페이지 및 버튼 처리
+        else:
+            if '?f1' in request: relay_fan.value(0); fan_st = "ON"
+            elif '?f0' in request: relay_fan.value(1); fan_st = "OFF"
+            elif '?p1' in request: relay_pump.value(0); pump_st = "ON"
+            elif '?p0' in request: relay_pump.value(1); pump_st = "OFF"
+            elif '?s1' in request: set_angle(90)
+            elif '?s0' in request: set_angle(0)
+
+            conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n')
+            conn.sendall(web_page().encode('utf-8'))
+        
+        conn.close()
+    except Exception as e:
+        print("서버 에러:", e)
+    gc.collect()
