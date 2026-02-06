@@ -1,0 +1,61 @@
+import network, machine, socket, gc, time
+from machine import Pin
+
+# --- [1. 릴레이 설정] ---
+# IN1을 GPIO 16에 연결함
+relay_fan = Pin(16, Pin.OUT, value=1) 
+fan_state = "꺼짐"
+
+# --- [2. 네트워크 설정] ---
+SSID = 'IOT'
+PASSWORD = '12345678'
+
+def web_page():
+    # HUD를 엄청 간단하게 (디자인 요소 삭제)
+    return f"""<!DOCTYPE html><html><head><meta charset='UTF-8'>
+    <title>심플 제어</title></head><body>
+        <h1>환풍기 제어판</h1>
+        <p>현재 상태: <b>{fan_state}</b></p>
+        <hr>
+        <a href="/?f1"><button style="padding:20px; width:150px;">팬 켜기 (ON)</button></a>
+        <br><br>
+        <a href="/?f0"><button style="padding:20px; width:150px;">팬 끄기 (OFF)</button></a>
+    </body></html>"""
+
+# 와이파이 연결
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+wlan.connect(SSID, PASSWORD)
+
+print("와이파이 연결 중...", end="")
+while not wlan.isconnected():
+    print(".", end="")
+    time.sleep(0.5)
+
+print("\n✅ 연결 성공!")
+print("접속 주소: http://" + wlan.ifconfig()[0])
+
+# 서버 설정
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('', 80))
+s.listen(1)
+
+while True:
+    try:
+        conn, addr = s.accept()
+        request = conn.recv(1024).decode()
+        
+        if '?f1' in request:
+            relay_fan.value(0) # 릴레이 ON
+            fan_state = "작동 중"
+        elif '?f0' in request:
+            relay_fan.value(1) # 릴레이 OFF
+            fan_state = "꺼짐"
+
+        response = web_page()
+        conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n')
+        conn.sendall(response.encode('utf-8'))
+        conn.close()
+    except Exception as e:
+        print("에러 발생:", e)
+    gc.collect()
