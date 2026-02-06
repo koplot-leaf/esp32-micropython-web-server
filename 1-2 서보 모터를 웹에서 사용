@@ -1,0 +1,75 @@
+import network, machine, socket, gc, time
+from machine import Pin, PWM
+
+# --- [1. 장치 설정] ---
+# 릴레이 (12V 팬) - GPIO 16
+relay_fan = Pin(16, Pin.OUT, value=1)
+fan_state = "꺼짐"
+
+# 서보모터 (SG90) - GPIO 17
+servo_pin = Pin(17)
+servo = PWM(servo_pin, freq=50)
+
+def set_angle(angle):
+    # 각도 계산 (0~180도)
+    duty = int(((angle / 180) * 102) + 26)
+    servo.duty(duty)
+
+set_angle(0) # 초기 각도 0도
+
+# --- [2. 네트워크 설정] ---
+SSID = 'IOT'
+PASSWORD = '12345678'
+
+def web_page():
+    return f"""<!DOCTYPE html><html><head><meta charset='UTF-8'></head><body>
+        <h1>스마트 화장실 제어</h1>
+        <p>팬 상태: <b>{fan_state}</b></p>
+        <hr>
+        <h3>환풍기 제어</h3>
+        <a href="/?f1"><button style="padding:15px; width:120px;">팬 켜기</button></a>
+        <a href="/?f0"><button style="padding:15px; width:120px;">팬 끄기</button></a>
+        <br>
+        <h3>서보 레버 제어</h3>
+        <a href="/?s1"><button style="padding:15px; width:120px;">레버 당기기</button></a>
+        <a href="/?s0"><button style="padding:15px; width:120px;">원위치</button></a>
+    </body></html>"""
+
+# 와이파이 연결
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+wlan.connect(SSID, PASSWORD)
+
+while not wlan.isconnected():
+    time.sleep(0.5)
+
+print("\n✅ 접속 주소: http://" + wlan.ifconfig()[0])
+
+# 서버 설정
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('', 80))
+s.listen(1)
+
+while True:
+    try:
+        conn, addr = s.accept()
+        request = conn.recv(1024).decode()
+        
+        if '?f1' in request:
+            relay_fan.value(0)
+            fan_state = "작동 중"
+        elif '?f0' in request:
+            relay_fan.value(1)
+            fan_state = "꺼짐"
+        elif '?s1' in request:
+            set_angle(90)
+        elif '?s0' in request:
+            set_angle(0)
+
+        response = web_page()
+        conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n')
+        conn.sendall(response.encode('utf-8'))
+        conn.close()
+    except:
+        pass
+    gc.collect()
