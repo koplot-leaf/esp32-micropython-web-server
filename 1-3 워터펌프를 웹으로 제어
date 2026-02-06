@@ -1,1 +1,63 @@
+import network, machine, socket, gc, time
+from machine import Pin, PWM
 
+# --- [1. 장치 설정] ---
+relay_fan = Pin(16, Pin.OUT, value=1)  
+relay_pump = Pin(17, Pin.OUT, value=1) 
+fan_st, pump_st = "OFF", "OFF"
+
+# 서보모터 (GPIO 15)
+servo = PWM(Pin(15), freq=50)
+def set_angle(angle):
+    duty = int(((angle / 180) * 102) + 26)
+    servo.duty(duty)
+set_angle(0)
+
+# --- [2. 네트워크 설정] ---
+SSID, PW = 'IOT', '12345678'
+
+def web_page():
+    # 이모티콘을 모두 제거하고 텍스트로만 구성
+    return f"""<!DOCTYPE html><html><head><meta charset='UTF-8'></head><body>
+        <h1>스마트 제어 시스템</h1>
+        <p>환풍기 상태: {fan_st} / 워터펌프 상태: {pump_st}</p>
+        <hr>
+        <h3>환풍기 제어</h3>
+        <a href="/?f1"><button style="padding:15px; width:100px;">켜기</button></a>
+        <a href="/?f0"><button style="padding:15px; width:100px;">끄기</button></a>
+        
+        <h3>워터펌프 제어</h3>
+        <a href="/?p1"><button style="padding:15px; width:100px;">작동</button></a>
+        <a href="/?p0"><button style="padding:15px; width:100px;">정지</button></a>
+        
+        <h3>서보 레버 제어</h3>
+        <a href="/?s1"><button style="padding:15px; width:100px;">90도</button></a>
+        <a href="/?s0"><button style="padding:15px; width:100px;">0도</button></a>
+    </body></html>"""
+
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+wlan.connect(SSID, PW)
+while not wlan.isconnected(): time.sleep(0.5)
+print("\n주소: http://" + wlan.ifconfig()[0])
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('', 80)); s.listen(1)
+
+while True:
+    try:
+        conn, addr = s.accept()
+        req = conn.recv(1024).decode()
+        
+        if '?f1' in req: relay_fan.value(0); fan_st = "ON"
+        elif '?f0' in req: relay_fan.value(1); fan_st = "OFF"
+        elif '?p1' in req: relay_pump.value(0); pump_st = "ON"
+        elif '?p0' in req: relay_pump.value(1); pump_st = "OFF"
+        elif '?s1' in req: set_angle(90)
+        elif '?s0' in req: set_angle(0)
+
+        conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n')
+        conn.sendall(web_page().encode('utf-8'))
+        conn.close()
+    except: pass
+    gc.collect()
