@@ -1,0 +1,160 @@
+import network, machine, socket, gc, time, dht, json, ntptime, neopixel
+from machine import Pin, PWM, SPI
+import st7735
+
+# --- [0. 설정 및 색상] ---
+BLACK, WHITE, BLUE, YELLOW, CYAN, GREEN, RED, PURPLE = 0x0000, 0xFFFF, 0x001F, 0xFFE0, 0x07FF, 0x07E0, 0xF800, 0xF81F
+
+# 장치 설정
+spi = SPI(2, baudrate=20000000, polarity=0, phase=0, sck=Pin(18), mosi=Pin(23))
+tft = st7735.ST7735(spi, Pin(5), Pin(2), Pin(4), 128, 160)
+tft.init()
+
+relay_fan = Pin(16, Pin.OUT, value=1)
+relay_pump = Pin(17, Pin.OUT, value=1)
+sensor = dht.DHT11(Pin(14))
+ir_sensor = Pin(13, Pin.IN)
+touch_sensor = Pin(27, Pin.IN)
+servo = PWM(Pin(15), freq=50)
+
+# 네오픽셀 설정 (GPIO 26, 8발 기준 - 개수에 맞게 수정 가능)
+n_num = 8
+np = neopixel.NeoPixel(Pin(26), n_num)
+np_color = [255, 255, 255] # 기본색 화이트
+
+def set_angle(angle):
+    duty = int(((angle / 180) * 102) + 26)
+    servo.duty(duty)
+set_angle(0)
+
+def set_np(r, g, b):
+    for i in range(n_num): np[i] = (r, g, b)
+    np.write()
+
+# --- [1. 네트워크 및 시간] ---
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+wlan.connect('IOT', '12345678')
+
+tft.fill(BLACK)
+tft.text(10, 70, "CONNECTING...", WHITE)
+while not wlan.isconnected(): time.sleep(0.5)
+
+try: ntptime.settime()
+except: pass
+UTC_OFFSET = 9 * 60 * 60
+ip = wlan.ifconfig()[0]
+tft.fill(BLACK)
+
+# --- [2. 상태 관리 변수] ---
+auto_mode = True
+fan_st, pump_st = "OFF", "OFF"
+auto_active = False # 자동모드 통합 동작 상태
+temp, hum = 0, 0
+last_sensor_time = 0
+last_touch_time = 0
+last_t_val, last_h_val, last_time_val = "", "", ""
+last_mode_st, last_fan_st, last_pump_st = "", "", ""
+
+def get_time_no_sec():
+    tm = time.localtime(time.time() + UTC_OFFSET)
+    return "{:02d}:{:02d}".format(tm[3], tm[4])
+
+def update_lcd():
+    global last_time_val, last_t_val, last_h_val, last_mode_st, last_fan_st, last_pump_st
+    cur_time = get_time_no_sec()
+    if cur_time != last_time_val:
+        tft.fill_rect(35, 8, 60, 10, BLUE); tft.text(40, 8, cur_time, WHITE); last_time_val = cur_time
+    
+    mode_text = "AUTO" if auto_mode else "MANUAL"
+    if mode_text != last_mode_st:
+        tft.fill_rect(70, 35, 55, 10, BLACK); tft.text(70, 35, mode_text, PURPLE); last_mode_st = mode_text
+
+    cur_t, cur_h = f"{temp}C", f"{hum}%"
+    if cur_t != last_t_val:
+        tft.fill_rect(70, 55, 45, 10, BLACK); tft.text(70, 55, cur_t, YELLOW); last_t_val = cur_t
+    if cur_h != last_h_val:
+        tft.fill_rect(70, 80, 45, 10, BLACK); tft.text(70, 80, cur_h, CYAN); last_h_val = cur_h
+
+    if fan_st != last_fan_st:
+        tft.fill_rect(70, 105, 35, 10, BLACK); tft.text(70, 105, fan_st, GREEN if fan_st == "ON" else RED); last_fan_st = fan_st
+    if pump_st != last_pump_st:
+        tft.fill_rect(70, 125, 35, 10, BLACK); tft.text(70, 125, pump_st, GREEN if pump_st == "ON" else RED); last_pump_st = pump_st
+
+tft.fill_rect(0, 0, 128, 25, BLUE)
+tft.text(10, 35, "MODE:", WHITE); tft.text(10, 55, "TEMP:", WHITE)
+tft.text(10, 80, "HUMI:", WHITE); tft.text(10, 105, "FAN :", WHITE); tft.text(10, 125, "PUMP:", WHITE)
+
+# --- [3. 웹 페이지] ---
+def web_page():
+    mode_btn = "수동으로 전환" if auto_mode else "자동으로 전환"
+    return f"""<!DOCTYPE html><html><head><meta charset='UTF-8'>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>button {{ width:110px; height:45px; margin:5px; }}</style>
+    </head><body>
+        <h2>Smart System Control</h2>
+        <p>모드: <b>{"자동" if auto_mode else "수동"}</b> <a href="/mode"><button>{mode_btn}</button></a></p>
+        <hr>
+        <p>Temp: {temp}C / Humi: {hum}%</p>
+        <p>네오픽셀 색상 선택: <input type="color" onchange="location.href='/?rgb='+this.value.substring(1)"></p>
+        <hr>
+        <h3>장치 수동 제어</h3>
+        <a href="/?f1"><button>FAN ON</button></a> <a href="/?f0"><button>FAN OFF</button></a><br>
+        <a href="/?p1"><button>PUMP ON</button></a> <a href="/?p0"><button>PUMP OFF</button></a><br>
+        <a href="/?s1"><button>SERVO 90</button></a> <a href="/?s0"><button>SERVO 0</button></a><br>
+        <a href="/?n1"><button>LED ON</button></a> <a href="/?n0"><button>LED OFF</button></a>
+    </body></html>"""
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('', 80)); s.listen(2); s.settimeout(0.1)
+
+while True:
+    if time.time() - last_sensor_time > 5:
+        try: sensor.measure(); temp, hum = sensor.temperature(), sensor.humidity(); last_sensor_time = time.time()
+        except: pass
+
+    # 터치 센서 로직
+    if touch_sensor.value() == 1:
+        if time.ticks_diff(time.ticks_ms(), last_touch_time) > 500:
+            if auto_mode:
+                auto_active = not auto_active
+                if auto_active:
+                    relay_fan.value(0); fan_st = "ON"; set_angle(90); set_np(*np_color)
+                else:
+                    relay_fan.value(1); fan_st = "OFF"; set_angle(0); set_np(0, 0, 0)
+            else:
+                auto_mode = True
+            last_touch_time = time.ticks_ms()
+
+    update_lcd()
+
+    try:
+        try:
+            conn, addr = s.accept()
+            request = conn.recv(1024).decode()
+            
+            if '/mode' in request:
+                auto_mode = not auto_mode
+                conn.send('HTTP/1.1 303 See Other\r\nLocation: /\r\n\r\n')
+            else:
+                if 'rgb=' in request:
+                    hex_color = request.split('rgb=')[1].split(' ')[0]
+                    np_color = [int(hex_color[i:i+2], 16) for i in (0, 2, 4)]
+                    if not auto_mode or auto_active: set_np(*np_color)
+
+                if not auto_mode: # 수동모드 제어
+                    if '?f1' in request: relay_fan.value(0); fan_st = "ON"
+                    elif '?f0' in request: relay_fan.value(1); fan_st = "OFF"
+                    elif '?p1' in request: relay_pump.value(0); pump_st = "ON"
+                    elif '?p0' in request: relay_pump.value(1); pump_st = "OFF"
+                    elif '?s1' in request: set_angle(90)
+                    elif '?s0' in request: set_angle(0)
+                    elif '?n1' in request: set_np(*np_color)
+                    elif '?n0' in request: set_np(0, 0, 0)
+
+                conn.send('HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n')
+                conn.sendall(web_page().encode('utf-8'))
+            conn.close()
+        except OSError: pass
+    except: pass
+    gc.collect()
